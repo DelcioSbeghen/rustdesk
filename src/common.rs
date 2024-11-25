@@ -1,135 +1,19 @@
 use std::{
-    borrow::Cow,
     collections::HashMap,
     future::Future,
     sync::{Arc, Mutex, RwLock},
     task::Poll,
 };
 
-use serde_json::Value;
+use serde_json::{json, Map, Value};
 
-#[derive(Debug, Eq, PartialEq)]
-pub enum GrabState {
-    Ready,
-    Run,
-    Wait,
-    Exit,
-}
-
-#[cfg(all(target_os = "linux", feature = "unix-file-copy-paste"))]
-static X11_CLIPBOARD: once_cell::sync::OnceCell<x11_clipboard::Clipboard> =
-    once_cell::sync::OnceCell::new();
-
-#[cfg(all(target_os = "linux", feature = "unix-file-copy-paste"))]
-fn get_clipboard() -> Result<&'static x11_clipboard::Clipboard, String> {
-    X11_CLIPBOARD
-        .get_or_try_init(|| x11_clipboard::Clipboard::new())
-        .map_err(|e| e.to_string())
-}
-
-#[cfg(all(target_os = "linux", feature = "unix-file-copy-paste"))]
-pub struct ClipboardContext {
-    string_setter: x11rb::protocol::xproto::Atom,
-    string_getter: x11rb::protocol::xproto::Atom,
-    text_uri_list: x11rb::protocol::xproto::Atom,
-
-    clip: x11rb::protocol::xproto::Atom,
-    prop: x11rb::protocol::xproto::Atom,
-}
-
-#[cfg(all(target_os = "linux", feature = "unix-file-copy-paste"))]
-fn parse_plain_uri_list(v: Vec<u8>) -> Result<String, String> {
-    let text = String::from_utf8(v).map_err(|_| "ConversionFailure".to_owned())?;
-    let mut list = String::new();
-    for line in text.lines() {
-        if !line.starts_with("file://") {
-            continue;
-        }
-        let decoded = percent_encoding::percent_decode_str(line)
-            .decode_utf8()
-            .map_err(|_| "ConversionFailure".to_owned())?;
-        list = list + "\n" + decoded.trim_start_matches("file://");
-    }
-    list = list.trim().to_owned();
-    Ok(list)
-}
-
-#[cfg(all(target_os = "linux", feature = "unix-file-copy-paste"))]
-impl ClipboardContext {
-    pub fn new() -> Result<Self, String> {
-        let clipboard = get_clipboard()?;
-        let string_getter = clipboard
-            .getter
-            .get_atom("UTF8_STRING")
-            .map_err(|e| e.to_string())?;
-        let string_setter = clipboard
-            .setter
-            .get_atom("UTF8_STRING")
-            .map_err(|e| e.to_string())?;
-        let text_uri_list = clipboard
-            .getter
-            .get_atom("text/uri-list")
-            .map_err(|e| e.to_string())?;
-        let prop = clipboard.getter.atoms.property;
-        let clip = clipboard.getter.atoms.clipboard;
-        Ok(Self {
-            text_uri_list,
-            string_setter,
-            string_getter,
-            clip,
-            prop,
-        })
-    }
-
-    pub fn get_text(&mut self) -> Result<String, String> {
-        let clip = self.clip;
-        let prop = self.prop;
-
-        const TIMEOUT: std::time::Duration = std::time::Duration::from_millis(120);
-
-        let text_content = get_clipboard()?
-            .load(clip, self.string_getter, prop, TIMEOUT)
-            .map_err(|e| e.to_string())?;
-
-        let file_urls = get_clipboard()?.load(clip, self.text_uri_list, prop, TIMEOUT);
-
-        if file_urls.is_err() || file_urls.as_ref().unwrap().is_empty() {
-            log::trace!("clipboard get text, no file urls");
-            return String::from_utf8(text_content).map_err(|e| e.to_string());
-        }
-
-        let file_urls = parse_plain_uri_list(file_urls.unwrap())?;
-
-        let text_content = String::from_utf8(text_content).map_err(|e| e.to_string())?;
-
-        if text_content.trim() == file_urls.trim() {
-            log::trace!("clipboard got text but polluted");
-            return Err(String::from("polluted text"));
-        }
-
-        Ok(text_content)
-    }
-
-    pub fn set_text(&mut self, content: String) -> Result<(), String> {
-        let clip = self.clip;
-
-        let value = content.clone().into_bytes();
-        get_clipboard()?
-            .store(clip, self.string_setter, value)
-            .map_err(|e| e.to_string())?;
-        Ok(())
-    }
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use hbb_common::compress::decompress;
 use hbb_common::{
     allow_err,
     anyhow::{anyhow, Context},
     bail, base64,
     bytes::Bytes,
-    compress::compress as compress_func,
-    config::{self, Config, CONNECT_TIMEOUT, READ_TIMEOUT},
+    config::{self, Config, CONNECT_TIMEOUT, READ_TIMEOUT, RENDEZVOUS_PORT},
+    futures::future::join_all,
     futures_util::future::poll_fn,
     get_version_number, log,
     message_proto::*,
@@ -145,18 +29,21 @@ use hbb_common::{
     },
     ResultType,
 };
-// #[cfg(any(target_os = "android", target_os = "ios", feature = "cli"))]
-use hbb_common::{config::RENDEZVOUS_PORT, futures::future::join_all};
 
 use crate::{
     hbbs_http::create_http_client_async,
     ui_interface::{get_option, set_option},
 };
 
-pub type NotifyMessageBox = fn(String, String, String, String) -> dyn Future<Output = ()>;
+#[derive(Debug, Eq, PartialEq)]
+pub enum GrabState {
+    Ready,
+    Run,
+    Wait,
+    Exit,
+}
 
-pub const CLIPBOARD_NAME: &'static str = "clipboard";
-pub const CLIPBOARD_INTERVAL: u64 = 333;
+pub type NotifyMessageBox = fn(String, String, String, String) -> dyn Future<Output = ()>;
 
 // the executable name of the portable version
 pub const PORTABLE_APPNAME_RUNTIME_ENV_KEY: &str = "RUSTDESK_APPNAME";
@@ -165,6 +52,9 @@ pub const PLATFORM_WINDOWS: &str = "Windows";
 pub const PLATFORM_LINUX: &str = "Linux";
 pub const PLATFORM_MACOS: &str = "Mac OS";
 pub const PLATFORM_ANDROID: &str = "Android";
+
+pub const TIMER_OUT: Duration = Duration::from_secs(1);
+pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
 
 const MIN_VER_MULTI_UI_SESSION: &str = "1.2.4";
 
@@ -183,11 +73,7 @@ pub mod input {
 }
 
 lazy_static::lazy_static! {
-    pub static ref CONTENT: Arc<Mutex<String>> = Default::default();
     pub static ref SOFTWARE_UPDATE_URL: Arc<Mutex<String>> = Default::default();
-}
-
-lazy_static::lazy_static! {
     pub static ref DEVICE_ID: Arc<Mutex<String>> = Default::default();
     pub static ref DEVICE_NAME: Arc<Mutex<String>> = Default::default();
 }
@@ -198,11 +84,7 @@ lazy_static::lazy_static! {
     // Is server logic running. The server code can invoked to run by the main process if --server is not running.
     static ref SERVER_RUNNING: Arc<RwLock<bool>> = Default::default();
     static ref IS_MAIN: bool = std::env::args().nth(1).map_or(true, |arg| !arg.starts_with("--"));
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-lazy_static::lazy_static! {
-    static ref ARBOARD_MTX: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+    static ref IS_CM: bool = std::env::args().nth(1) == Some("--cm".to_owned()) || std::env::args().nth(1) == Some("--cm-no-ui".to_owned());
 }
 
 pub struct SimpleCallOnReturn {
@@ -256,6 +138,11 @@ pub fn is_main() -> bool {
     *IS_MAIN
 }
 
+#[inline]
+pub fn is_cm() -> bool {
+    *IS_CM
+}
+
 // Is server logic running.
 #[inline]
 pub fn is_server_running() -> bool {
@@ -271,48 +158,6 @@ pub fn valid_for_numlock(evt: &KeyEvent) -> bool {
     } else {
         false
     }
-}
-
-pub fn create_clipboard_msg(content: String) -> Message {
-    let bytes = content.into_bytes();
-    let compressed = compress_func(&bytes);
-    let compress = compressed.len() < bytes.len();
-    let content = if compress { compressed } else { bytes };
-    let mut msg = Message::new();
-    msg.set_clipboard(Clipboard {
-        compress,
-        content: content.into(),
-        ..Default::default()
-    });
-    msg
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn check_clipboard(
-    ctx: &mut Option<ClipboardContext>,
-    old: Option<&Arc<Mutex<String>>>,
-) -> Option<Message> {
-    if ctx.is_none() {
-        *ctx = ClipboardContext::new().ok();
-    }
-    let ctx2 = ctx.as_mut()?;
-    let side = if old.is_none() { "host" } else { "client" };
-    let old = if let Some(old) = old { old } else { &CONTENT };
-    let content = {
-        let _lock = ARBOARD_MTX.lock().unwrap();
-        ctx2.get_text()
-    };
-    if let Ok(content) = content {
-        if content.len() < 2_000_000 && !content.is_empty() {
-            let changed = content != *old.lock().unwrap();
-            if changed {
-                log::info!("{} update found on {}", CLIPBOARD_NAME, side);
-                *old.lock().unwrap() = content.clone();
-                return Some(create_clipboard_msg(content));
-            }
-        }
-    }
-    None
 }
 
 /// Set sound input device.
@@ -361,34 +206,6 @@ pub fn get_default_sound_input() -> Option<String> {
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub fn get_default_sound_input() -> Option<String> {
     None
-}
-
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn update_clipboard(clipboard: Clipboard, old: Option<&Arc<Mutex<String>>>) {
-    let content = if clipboard.compress {
-        decompress(&clipboard.content)
-    } else {
-        clipboard.content.into()
-    };
-    if let Ok(content) = String::from_utf8(content) {
-        if content.is_empty() {
-            // ctx.set_text may crash if content is empty
-            return;
-        }
-        match ClipboardContext::new() {
-            Ok(mut ctx) => {
-                let side = if old.is_none() { "host" } else { "client" };
-                let old = if let Some(old) = old { old } else { &CONTENT };
-                *old.lock().unwrap() = content.clone();
-                let _lock = ARBOARD_MTX.lock().unwrap();
-                allow_err!(ctx.set_text(content));
-                log::debug!("{} updated on {}", CLIPBOARD_NAME, side);
-            }
-            Err(err) => {
-                log::error!("Failed to create clipboard context: {}", err);
-            }
-        }
-    }
 }
 
 #[cfg(feature = "use_rubato")]
@@ -1011,6 +828,15 @@ async fn check_software_update_() -> hbb_common::ResultType<()> {
     let response_url = latest_release_response.url().to_string();
 
     if get_version_number(&latest_release_version) > get_version_number(crate::VERSION) {
+        #[cfg(feature = "flutter")]
+        {
+            let mut m = HashMap::new();
+            m.insert("name", "check_software_update_finish");
+            m.insert("url", &response_url);
+            if let Ok(data) = serde_json::to_string(&m) {
+                let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+            }
+        }
         *SOFTWARE_UPDATE_URL.lock().unwrap() = response_url;
     }
     Ok(())
@@ -1225,6 +1051,11 @@ pub fn get_supported_keyboard_modes(version: i64, peer_platform: &str) -> Vec<Ke
 }
 
 pub fn make_fd_to_json(id: i32, path: String, entries: &Vec<FileEntry>) -> String {
+    let fd_json = _make_fd_to_json(id, path, entries);
+    serde_json::to_string(&fd_json).unwrap_or("".into())
+}
+
+pub fn _make_fd_to_json(id: i32, path: String, entries: &Vec<FileEntry>) -> Map<String, Value> {
     use serde_json::json;
     let mut fd_json = serde_json::Map::new();
     fd_json.insert("id".into(), json!(id));
@@ -1240,7 +1071,33 @@ pub fn make_fd_to_json(id: i32, path: String, entries: &Vec<FileEntry>) -> Strin
         entries_out.push(entry_map);
     }
     fd_json.insert("entries".into(), json!(entries_out));
-    serde_json::to_string(&fd_json).unwrap_or("".into())
+    fd_json
+}
+
+pub fn make_vec_fd_to_json(fds: &[FileDirectory]) -> String {
+    let mut fd_jsons = vec![];
+
+    for fd in fds.iter() {
+        let fd_json = _make_fd_to_json(fd.id, fd.path.clone(), &fd.entries);
+        fd_jsons.push(fd_json);
+    }
+
+    serde_json::to_string(&fd_jsons).unwrap_or("".into())
+}
+
+pub fn make_empty_dirs_response_to_json(res: &ReadEmptyDirsResponse) -> String {
+    let mut map: Map<String, Value> = serde_json::Map::new();
+    map.insert("path".into(), json!(res.path));
+
+    let mut fd_jsons = vec![];
+
+    for fd in res.empty_dirs.iter() {
+        let fd_json = _make_fd_to_json(fd.id, fd.path.clone(), &fd.entries);
+        fd_jsons.push(fd_json);
+    }
+    map.insert("empty_dirs".into(), fd_jsons.into());
+
+    serde_json::to_string(&map).unwrap_or("".into())
 }
 
 /// The function to handle the url scheme sent by the system.
@@ -1503,64 +1360,6 @@ pub fn rustdesk_interval(i: Interval) -> ThrottledInterval {
     ThrottledInterval::new(i)
 }
 
-#[cfg(not(any(
-    target_os = "android",
-    target_os = "ios",
-    all(target_os = "linux", feature = "unix-file-copy-paste")
-)))]
-pub struct ClipboardContext(arboard::Clipboard);
-
-#[cfg(not(any(
-    target_os = "android",
-    target_os = "ios",
-    all(target_os = "linux", feature = "unix-file-copy-paste")
-)))]
-impl ClipboardContext {
-    #[inline]
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    pub fn new() -> ResultType<ClipboardContext> {
-        Ok(ClipboardContext(arboard::Clipboard::new()?))
-    }
-
-    #[cfg(target_os = "linux")]
-    pub fn new() -> ResultType<ClipboardContext> {
-        let mut i = 1;
-        loop {
-            // Try 5 times to create clipboard
-            // Arboard::new() connect to X server or Wayland compositor, which shoud be ok at most time
-            // But sometimes, the connection may fail, so we retry here.
-            match arboard::Clipboard::new() {
-                Ok(x) => return Ok(ClipboardContext(x)),
-                Err(e) => {
-                    if i == 5 {
-                        return Err(e.into());
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_millis(30 * i));
-                    }
-                }
-            }
-            i += 1;
-        }
-    }
-
-    #[inline]
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    pub fn get_text(&mut self) -> ResultType<String> {
-        Ok(self.0.get_text()?)
-    }
-
-    #[cfg(target_os = "linux")]
-    pub fn get_text(&mut self) -> ResultType<String> {
-        Ok(self.0.get_text()?)
-    }
-
-    #[inline]
-    pub fn set_text<'a, T: Into<Cow<'a, str>>>(&mut self, text: T) -> ResultType<()> {
-        self.0.set_text(text)?;
-        Ok(())
-    }
-}
-
 pub fn load_custom_client() {
     #[cfg(debug_assertions)]
     if let Ok(data) = std::fs::read_to_string("./custom.txt") {
@@ -1588,6 +1387,7 @@ fn read_custom_client_advanced_settings(
     map_display_settings: &HashMap<String, &&str>,
     map_local_settings: &HashMap<String, &&str>,
     map_settings: &HashMap<String, &&str>,
+    map_buildin_settings: &HashMap<String, &&str>,
     is_override: bool,
 ) {
     let mut display_settings = if is_override {
@@ -1605,6 +1405,8 @@ fn read_custom_client_advanced_settings(
     } else {
         config::DEFAULT_SETTINGS.write().unwrap()
     };
+    let mut buildin_settings = config::BUILTIN_SETTINGS.write().unwrap();
+
     if let Some(settings) = settings.as_object() {
         for (k, v) in settings {
             let Some(v) = v.as_str() else {
@@ -1616,6 +1418,8 @@ fn read_custom_client_advanced_settings(
                 local_settings.insert(k2.to_string(), v.to_owned());
             } else if let Some(k2) = map_settings.get(k) {
                 server_settings.insert(k2.to_string(), v.to_owned());
+            } else if let Some(k2) = map_buildin_settings.get(k) {
+                buildin_settings.insert(k2.to_string(), v.to_owned());
             } else {
                 let k2 = k.replace("_", "-");
                 let k = k2.replace("-", "_");
@@ -1628,6 +1432,9 @@ fn read_custom_client_advanced_settings(
                 // server
                 server_settings.insert(k.clone(), v.to_owned());
                 server_settings.insert(k2.clone(), v.to_owned());
+                // buildin
+                buildin_settings.insert(k.clone(), v.to_owned());
+                buildin_settings.insert(k2.clone(), v.to_owned());
             }
         }
     }
@@ -1690,12 +1497,17 @@ pub fn read_custom_client(config: &str) {
     for s in config::keys::KEYS_SETTINGS {
         map_settings.insert(s.replace("_", "-"), s);
     }
+    let mut buildin_settings = HashMap::new();
+    for s in config::keys::KEYS_BUILDIN_SETTINGS {
+        buildin_settings.insert(s.replace("_", "-"), s);
+    }
     if let Some(default_settings) = data.remove("default-settings") {
         read_custom_client_advanced_settings(
             default_settings,
             &map_display_settings,
             &map_local_settings,
             &map_settings,
+            &buildin_settings,
             false,
         );
     }
@@ -1705,6 +1517,7 @@ pub fn read_custom_client(config: &str) {
             &map_display_settings,
             &map_local_settings,
             &map_settings,
+            &buildin_settings,
             true,
         );
     }
@@ -1725,6 +1538,15 @@ pub fn is_empty_uni_link(arg: &str) -> bool {
         return false;
     }
     arg[prefix.len()..].chars().all(|c| c == '/')
+}
+
+pub fn get_hwid() -> Bytes {
+    use sha2::{Digest, Sha256};
+
+    let uuid = hbb_common::get_uuid();
+    let mut hasher = Sha256::new();
+    hasher.update(&uuid);
+    Bytes::from(hasher.finalize().to_vec())
 }
 
 #[cfg(test)]
@@ -1867,4 +1689,14 @@ mod tests {
             Duration::from_nanos(0)
         );
     }
+}
+
+#[inline]
+pub fn get_builtin_option(key: &str) -> String {
+    config::BUILTIN_SETTINGS
+        .read()
+        .unwrap()
+        .get(key)
+        .cloned()
+        .unwrap_or_default()
 }
