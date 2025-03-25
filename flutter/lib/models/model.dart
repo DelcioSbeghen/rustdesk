@@ -402,8 +402,14 @@ class FfiModel with ChangeNotifier {
         if (isWeb) {
           parent.target?.fileModel.onSelectedFiles(evt);
         }
+      } else if (name == "send_emptry_dirs") {
+        if (isWeb) {
+          parent.target?.fileModel.sendEmptyDirs(evt);
+        }
       } else if (name == "record_status") {
-        if (desktopType == DesktopType.remote || isMobile) {
+        if (desktopType == DesktopType.remote ||
+            desktopType == DesktopType.viewCamera ||
+            isMobile) {
           parent.target?.recordingModel.updateStatus(evt['start'] == 'true');
         }
       } else {
@@ -497,7 +503,9 @@ class FfiModel with ChangeNotifier {
     final display = int.parse(evt['display']);
 
     if (_pi.currentDisplay != kAllDisplayValue) {
-      if (bind.peerGetDefaultSessionsCount(id: peerId) > 1) {
+      if (bind.peerGetSessionsCount(
+              id: peerId, connType: parent.target!.connType.index) >
+          1) {
         if (display != _pi.currentDisplay) {
           return;
         }
@@ -805,7 +813,9 @@ class FfiModel with ChangeNotifier {
       _pi.primaryDisplay = currentDisplay;
     }
 
-    if (bind.peerGetDefaultSessionsCount(id: peerId) <= 1) {
+    if (bind.peerGetSessionsCount(
+            id: peerId, connType: parent.target!.connType.index) <=
+        1) {
       _pi.currentDisplay = currentDisplay;
     }
 
@@ -823,9 +833,11 @@ class FfiModel with ChangeNotifier {
               sessionId: sessionId, arg: kOptionTouchMode) !=
           '';
     }
+    // FIXME: handle ViewCamera ConnType independently.
     if (connType == ConnType.fileTransfer) {
       parent.target?.fileModel.onReady();
-    } else if (connType == ConnType.defaultConn) {
+    } else if (connType == ConnType.defaultConn ||
+        connType == ConnType.viewCamera) {
       List<Display> newDisplays = [];
       List<dynamic> displays = json.decode(evt['displays']);
       for (int i = 0; i < displays.length; ++i) {
@@ -855,7 +867,7 @@ class FfiModel with ChangeNotifier {
           bind.sessionGetToggleOptionSync(
               sessionId: sessionId, arg: kOptionToggleViewOnly));
     }
-    if (connType == ConnType.defaultConn) {
+    if (connType == ConnType.defaultConn || connType == ConnType.viewCamera) {
       final platformAdditions = evt['platform_additions'];
       if (platformAdditions != null && platformAdditions != '') {
         try {
@@ -1268,7 +1280,9 @@ class ImageModel with ChangeNotifier {
       rgba,
       rect?.width.toInt() ?? 0,
       rect?.height.toInt() ?? 0,
-      isWeb ? ui.PixelFormat.rgba8888 : ui.PixelFormat.bgra8888,
+      isWeb | isWindows | isLinux
+          ? ui.PixelFormat.rgba8888
+          : ui.PixelFormat.bgra8888,
     );
     if (parent.target?.id != pid) return;
     await update(image);
@@ -1494,13 +1508,15 @@ class CanvasModel with ChangeNotifier {
     return max(bottom - MediaQueryData.fromView(ui.window).padding.top, 0);
   }
 
+  updateSize() => _size = getSize();
+
   updateViewStyle({refreshMousePos = true, notify = true}) async {
     final style = await bind.sessionGetViewStyle(sessionId: sessionId);
     if (style == null) {
       return;
     }
 
-    _size = getSize();
+    updateSize();
     final displayWidth = getDisplayWidth();
     final displayHeight = getDisplayHeight();
     final viewStyle = ViewStyle(
@@ -1537,7 +1553,7 @@ class CanvasModel with ChangeNotifier {
   _resetCanvasOffset(int displayWidth, int displayHeight) {
     _x = (size.width - displayWidth * _scale) / 2;
     _y = (size.height - displayHeight * _scale) / 2;
-    if (isMobile && _lastViewStyle.style == kRemoteViewStyleOriginal) {
+    if (isMobile) {
       _moveToCenterCursor();
     }
   }
@@ -1730,7 +1746,8 @@ class CanvasModel with ChangeNotifier {
     _timerMobileFocusCanvasCursor?.cancel();
     _timerMobileFocusCanvasCursor =
         Timer(Duration(milliseconds: 100), () async {
-      await updateViewStyle(refreshMousePos: false, notify: false);
+      updateSize();
+      _resetCanvasOffset(getDisplayWidth(), getDisplayHeight());
       notifyListeners();
     });
   }
@@ -2184,7 +2201,7 @@ class CursorModel with ChangeNotifier {
 
     if (dx == 0 && dy == 0) return;
 
-    Point? newPos;
+    Point<double>? newPos;
     final rect = parent.target?.ffiModel.rect;
     if (rect == null) {
       // unreachable
@@ -2195,8 +2212,8 @@ class CursorModel with ChangeNotifier {
         parent.target?.ffiModel.pi.platform,
         kPointerEventKindMouse,
         kMouseEventTypeDefault,
-        (_x + dx).toInt(),
-        (_y + dy).toInt(),
+        _x + dx,
+        _y + dy,
         rect,
         buttons: kPrimaryButton);
     if (newPos == null) {
@@ -2204,8 +2221,8 @@ class CursorModel with ChangeNotifier {
     }
     dx = newPos.x - _x;
     dy = newPos.y - _y;
-    _x = newPos.x.toDouble();
-    _y = newPos.y.toDouble();
+    _x = newPos.x;
+    _y = newPos.y;
     if (tryMoveCanvasX && dx != 0) {
       parent.target?.canvasModel.panX(-dx * scale);
     }
@@ -2421,6 +2438,8 @@ class CursorModel with ChangeNotifier {
     _x = -10000;
     _x = -10000;
     _image = null;
+    _firstUpdateMouseTime = null;
+    gotMouseControl = true;
     disposeImages();
 
     _clearCache();
@@ -2565,7 +2584,8 @@ class ElevationModel with ChangeNotifier {
   onPortableServiceRunning(bool running) => _running = running;
 }
 
-enum ConnType { defaultConn, fileTransfer, portForward, rdp }
+// The index values of `ConnType` are same as rust protobuf.
+enum ConnType { defaultConn, fileTransfer, portForward, rdp, viewCamera }
 
 /// Flutter state manager and data communication with the Rust core.
 class FFI {
@@ -2640,10 +2660,11 @@ class FFI {
     ffiModel.waitForImageTimer = null;
   }
 
-  /// Start with the given [id]. Only transfer file if [isFileTransfer], only port forward if [isPortForward].
+  /// Start with the given [id]. Only transfer file if [isFileTransfer], only view camera if [isViewCamera], only port forward if [isPortForward].
   void start(
     String id, {
     bool isFileTransfer = false,
+    bool isViewCamera = false,
     bool isPortForward = false,
     bool isRdp = false,
     String? switchUuid,
@@ -2658,9 +2679,15 @@ class FFI {
     closed = false;
     auditNote = '';
     if (isMobile) mobileReset();
-    assert(!(isFileTransfer && isPortForward), 'more than one connect type');
+    assert(
+        (!(isPortForward && isViewCamera)) &&
+            (!(isViewCamera && isPortForward)) &&
+            (!(isPortForward && isFileTransfer)),
+        'more than one connect type');
     if (isFileTransfer) {
       connType = ConnType.fileTransfer;
+    } else if (isViewCamera) {
+      connType = ConnType.viewCamera;
     } else if (isPortForward) {
       connType = ConnType.portForward;
     } else {
@@ -2680,6 +2707,7 @@ class FFI {
         sessionId: sessionId,
         id: id,
         isFileTransfer: isFileTransfer,
+        isViewCamera: isViewCamera,
         isPortForward: isPortForward,
         isRdp: isRdp,
         switchUuid: switchUuid ?? '',
@@ -2695,7 +2723,10 @@ class FFI {
         return;
       }
       final addRes = bind.sessionAddExistedSync(
-          id: id, sessionId: sessionId, displays: Int32List.fromList(displays));
+          id: id,
+          sessionId: sessionId,
+          displays: Int32List.fromList(displays),
+          isViewCamera: isViewCamera);
       if (addRes != '') {
         debugPrint(
             'Unreachable, failed to add existed session to $id, $addRes');
@@ -2704,6 +2735,11 @@ class FFI {
       ffiModel.pi.currentDisplay = display;
     }
     if (isDesktop && connType == ConnType.defaultConn) {
+      textureModel.updateCurrentDisplay(display ?? 0);
+    }
+    // FIXME: separate cameras displays or shift all indices.
+    if (isDesktop && connType == ConnType.viewCamera) {
+      // FIXME: currently the default 0 is not used.
       textureModel.updateCurrentDisplay(display ?? 0);
     }
 
@@ -2859,6 +2895,7 @@ class FFI {
           canvasModel.scale,
           ffiModel.pi.currentDisplay);
     }
+    imageModel.callbacksOnFirstImage.clear();
     await imageModel.update(null);
     cursorModel.clear();
     ffiModel.clear();
@@ -2980,6 +3017,9 @@ class PeerInfo with ChangeNotifier {
       platformAdditions[kPlatformAdditionsIddImpl] == 'rustdesk_idd';
   bool get isAmyuniIdd =>
       platformAdditions[kPlatformAdditionsIddImpl] == 'amyuni_idd';
+
+  bool get isSupportViewCamera =>
+      platformAdditions[kPlatformAdditionsSupportViewCamera] == true;
 
   Display? tryGetDisplay({int? display}) {
     if (displays.isEmpty) {
