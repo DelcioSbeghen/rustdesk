@@ -1,0 +1,12 @@
+name: SRP Nightly Build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-srp-nightly-build:
+    uses: ./.github/workflows/srp.yml
+    secrets: inherit
+    with:
+      upload-artifact: true
+      upload-tag: "nightly"
